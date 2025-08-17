@@ -6,9 +6,12 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 
+// WebSocket
 AsyncWebSocket ws("/ws");
 
+// ---------------- STRUCT ----------------
 struct AutoUpdatePayload {
   String ecran1 = "";
   String ecran2 = "";
@@ -30,16 +33,21 @@ struct AutoUpdatePayload {
   String statusMessage = "";
 };
 
+// ---------------- WIFI ----------------
 void connectToWiFi(const char* ssid, const char* password) {
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   Serial.print("Connexion au WiFi ..");
   while (WiFi.status() != WL_CONNECTED) {
     Serial.print('.');
     delay(1000);
   }
+  Serial.println();
+  Serial.print("IP: ");
   Serial.println(WiFi.localIP());
 }
 
+// ---------------- WEBSOCKET ----------------
 void onWebSocketEvent(
   AsyncWebSocket* server,
   AsyncWebSocketClient* client,
@@ -48,14 +56,18 @@ void onWebSocketEvent(
   uint8_t* data,
   size_t len,
   String* lastCommandPtr) {
+
   switch (type) {
     case WS_EVT_CONNECT:
-      Serial.printf("Client WebSocket #%u connecté depuis %s\n", client->id(), client->remoteIP().toString().c_str());
+      Serial.printf("Client WebSocket #%u connecté depuis %s\n",
+        client->id(), client->remoteIP().toString().c_str());
       break;
+
     case WS_EVT_DISCONNECT:
       Serial.printf("Client WebSocket #%u déconnecté\n", client->id());
       break;
-    case WS_EVT_DATA:
+
+    case WS_EVT_DATA: {
       AwsFrameInfo* info = (AwsFrameInfo*)arg;
       if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
         data[len] = 0;
@@ -63,19 +75,29 @@ void onWebSocketEvent(
         Serial.printf("Commande reçue : %s\n", (char*)data);
       }
       break;
+    }
+
+    default:
+      break;
   }
 }
 
 void setupWebSocket(AsyncWebServer& server, String* lastCommandPtr) {
-  ws.onEvent([lastCommandPtr](AsyncWebSocket* server, AsyncWebSocketClient* client, AwsEventType type, void* arg, uint8_t* data, size_t len) {
+  ws.onEvent([lastCommandPtr](AsyncWebSocket* server,
+                              AsyncWebSocketClient* client,
+                              AwsEventType type,
+                              void* arg,
+                              uint8_t* data,
+                              size_t len) {
     onWebSocketEvent(server, client, type, arg, data, len, lastCommandPtr);
   });
   server.addHandler(&ws);
   server.begin();
 }
 
+// ---------------- AUTO UPDATE ----------------
 void sendAutoUpdate(const AutoUpdatePayload& payload) {
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<768> doc;
 
   doc["Ecran1"] = payload.ecran1.isEmpty() ? String(millis()) : payload.ecran1;
   doc["Ecran2"] = payload.ecran2;
@@ -106,7 +128,7 @@ void sendAutoUpdate(const AutoUpdatePayload& payload) {
   doc["signal_strength"] = WiFi.RSSI();
   doc["gateway_ip"] = WiFi.gatewayIP().toString();
   doc["free_memory"] = ESP.getFreeHeap();
-  doc["flash_memory"] = ESP.getFlashChipSize();
+  doc["flash_memory"] = ESP.getFlashChipSize(); // équiv. ESP32
 
   String output;
   serializeJson(doc, output);
@@ -123,7 +145,9 @@ void processCommandIfNeeded(String& lastCommand, AutoUpdatePayload& payload) {
   }
 }
 
+// ---------------- EMAIL ----------------
 
+//...
 
 void sendEmail(String email, String subject, String message) {
   if (WiFi.status() != WL_CONNECTED) {
@@ -132,11 +156,16 @@ void sendEmail(String email, String subject, String message) {
   }
 
   HTTPClient http;
+  WiFiClientSecure client;
+  client.setInsecure(); // Ignore la vérification TLS (pratique mais non sécurisé)
 
-  String url = "https://script.google.com/macros/s/AKfycbwYkg3mOneVbI7umotIWl5-_AJNOMRte1UMSzCZ5758GzLc74cltNjeORuedDbfRNXh/exec"; // 🔁 remplace par ton URL Apps Script
+  String url = "https://script.google.com/macros/s/AKfycbwYkg3mOneVbI7umotIWl5-_AJNOMRte1UMSzCZ5758GzLc74cltNjeORuedDbfRNXh/exec";
   String postData = "email=" + email + "&subject=" + subject + "&message=" + message;
 
-  http.begin(url);
+  if (!http.begin(client, url)) {
+    Serial.println("http.begin() a échoué");
+    return;
+  }
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
 
   int httpCode = http.POST(postData);
@@ -149,5 +178,67 @@ void sendEmail(String email, String subject, String message) {
   http.end();
 }
 
+// ---------------- NOTIFY ONCE ----------------
+struct NotifyFlag {
+  String msg;
+  bool state;
+};
+static NotifyFlag notifyFlags[10];
+static int notifyCount = 0;
+
+void notifyOnce(AutoUpdatePayload &payload, const String &msg, bool condition) {
+  int idx = -1;
+  for (int i = 0; i < notifyCount; i++) {
+    if (notifyFlags[i].msg == msg) { idx = i; break; }
+  }
+  if (idx == -1 && notifyCount < 10) {
+    idx = notifyCount++;
+    notifyFlags[idx].msg = msg;
+    notifyFlags[idx].state = false;
+  }
+
+  if (idx >= 0) {
+    if (condition && !notifyFlags[idx].state) {
+      payload.notif = msg;
+      sendAutoUpdate(payload);
+      notifyFlags[idx].state = true;
+    } else if (!condition) {
+      notifyFlags[idx].state = false;
+    }
+  }
+}
+
+// ---------------- EMAIL ONCE ----------------
+struct EmailFlag {
+  String msg;
+  bool state;
+};
+static EmailFlag emailFlags[10];
+static int emailCount = 0;
+
+void sendEmailOnce(String toEmail, String subject, String message, const String &flagName, bool condition) {
+  int idx = -1;
+  for (int i = 0; i < emailCount; i++) {
+    if (emailFlags[i].msg == flagName) { idx = i; break; }
+  }
+  if (idx == -1 && emailCount < 10) {
+    idx = emailCount++;
+    emailFlags[idx].msg = flagName;
+    emailFlags[idx].state = false;
+  }
+
+  if (idx >= 0) {
+    if (condition && !emailFlags[idx].state) {
+      sendEmail(toEmail, subject, message);
+      emailFlags[idx].state = true;
+    } else if (!condition) {
+      emailFlags[idx].state = false;
+    }
+  }
+}
 
 #endif
+
+// Exemples d’usage :
+// notifyOnce(payload, "nono", smokeValue > 500);
+// sendEmailOnce("ermes1643@gmail.com", "Fumée détectée", "La valeur a dépassé 500", "smoke_alert", smokeValue > 500);
